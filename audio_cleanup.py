@@ -738,6 +738,94 @@ def apply_ai_retakes(segments: list[Segment], retake_ids: list[int],
     return segments
 
 
+def save_intermediates(input_file: Path, segments: list[Segment],
+                       sentences: list, remove_ids: set,
+                       stage: str, report: CleanupReport):
+    """
+    Save detailed intermediate files for debugging and auditing.
+
+    Outputs (saved to {input_stem}_intermediates/ directory):
+      - {stage}_decisions.json: Per-sentence keep/remove decisions with reasons
+      - {stage}_kept_segments.json: Time ranges of kept audio segments
+      - {stage}_removed_segments.json: Time ranges of removed audio segments
+      - {stage}_summary.txt: Human-readable summary
+    """
+    intermediates_dir = input_file.parent / f"{input_file.stem}_intermediates"
+    intermediates_dir.mkdir(exist_ok=True)
+
+    # 1. Per-sentence decisions
+    decisions = []
+    for i, sent in enumerate(sentences):
+        kept_words = [s for s in sent.word_segments if s.keep]
+        removed_words = [s for s in sent.word_segments if not s.keep]
+        decisions.append({
+            "sentence_id": i,
+            "text": sent.text,
+            "start": round(sent.start, 3),
+            "end": round(sent.end, 3),
+            "duration": round(sent.end - sent.start, 3),
+            "decision": "KEEP" if i not in remove_ids else "REMOVE",
+            "reason": "" if i not in remove_ids else "AI: fragment/repeat/incomplete",
+            "word_count": len(sent.word_segments),
+            "kept_words": len(kept_words),
+        })
+    decisions_path = intermediates_dir / f"{stage}_decisions.json"
+    with open(decisions_path, "w", encoding="utf-8") as f:
+        json.dump(decisions, f, ensure_ascii=False, indent=2)
+    print(f"  Saved: {decisions_path}")
+
+    # 2. Kept segments (time ranges)
+    kept_ranges = []
+    for seg in segments:
+        if seg.keep:
+            kept_ranges.append({
+                "start": round(seg.start, 3),
+                "end": round(seg.end, 3),
+                "text": seg.text,
+            })
+    kept_path = intermediates_dir / f"{stage}_kept_segments.json"
+    with open(kept_path, "w", encoding="utf-8") as f:
+        json.dump(kept_ranges, f, ensure_ascii=False, indent=2)
+    print(f"  Saved: {kept_path} ({len(kept_ranges)} segments)")
+
+    # 3. Removed segments
+    removed_ranges = []
+    for seg in segments:
+        if not seg.keep:
+            removed_ranges.append({
+                "start": round(seg.start, 3),
+                "end": round(seg.end, 3),
+                "text": seg.text,
+                "reason": seg.removal_reason,
+            })
+    removed_path = intermediates_dir / f"{stage}_removed_segments.json"
+    with open(removed_path, "w", encoding="utf-8") as f:
+        json.dump(removed_ranges, f, ensure_ascii=False, indent=2)
+    print(f"  Saved: {removed_path} ({len(removed_ranges)} segments)")
+
+    # 4. Human-readable summary
+    summary_path = intermediates_dir / f"{stage}_summary.txt"
+    with open(summary_path, "w", encoding="utf-8") as f:
+        f.write(f"=== {stage} Stage Summary ===\n\n")
+        f.write(f"Total sentences: {len(sentences)}\n")
+        kept_count = sum(1 for d in decisions if d['decision'] == 'KEEP')
+        removed_count = sum(1 for d in decisions if d['decision'] == 'REMOVE')
+        f.write(f"Kept: {kept_count}\n")
+        f.write(f"Removed: {removed_count}\n\n")
+        f.write(f"--- Kept Sentences ---\n")
+        for d in decisions:
+            if d['decision'] == 'KEEP':
+                f.write(f"  [{d['sentence_id']:3d}] ({d['start']:.1f}-{d['end']:.1f}s) {d['text']}\n")
+        f.write(f"\n--- Removed Sentences ---\n")
+        for d in decisions:
+            if d['decision'] == 'REMOVE':
+                f.write(f"  [{d['sentence_id']:3d}] ({d['start']:.1f}-{d['end']:.1f}s) {d['text']}\n")
+                f.write(f"         Reason: {d['reason']}\n")
+    print(f"  Saved: {summary_path}")
+
+    return str(intermediates_dir)
+
+
 def cleanup_audio(
     input_path: str,
     output_path: Optional[str] = None,
@@ -750,6 +838,7 @@ def cleanup_audio(
     show_report: bool = True,
     transcribe_only: bool = False,
     ai_retakes_file: Optional[str] = None,
+    save_intermediates_flag: bool = False,
 ) -> CleanupReport:
     """
     Main audio cleanup pipeline.
@@ -758,7 +847,7 @@ def cleanup_audio(
         input_path: Path to input audio file
         output_path: Path for output (default: input_cleaned.ext)
         language: Language code (zh, en)
-        mode: Cleanup mode — 'silence', 'filler', 'full', or 'ai'
+        mode: Cleanup mode — 'silence', 'filler', 'full', 'ai', or 'ai-only'
         model_size: Whisper model size (tiny, base, small, medium, large-v3)
         min_silence_ms: Minimum silence duration to remove (ms)
         keep_silence_ms: Silence to keep between segments (ms)
@@ -766,6 +855,14 @@ def cleanup_audio(
         show_report: Print cleanup report
         transcribe_only: Only transcribe and save transcript, don't rebuild
         ai_retakes_file: JSON file with AI-identified retake sentence IDs
+        save_intermediates_flag: Save detailed intermediate files for debugging
+
+    Modes:
+        silence:  Only remove long silences/pauses
+        filler:   Remove fillers + silences (rule-based)
+        full:     Full cleanup with rule-based repeat detection + optional AI
+        ai:       Rule-based detection + AI retakes (hybrid)
+        ai-only:  AI-only mode — skip all rule-based detection, use only AI retakes
 
     Returns:
         CleanupReport with details of what was removed
@@ -839,23 +936,63 @@ def cleanup_audio(
             print("Next: Run AI analysis on the sentences file, then use --ai-retakes to apply.")
             return report
 
-        # Step 2: Detect and mark removals
-        print("Step 2: Detecting fillers...")
-        segments = detect_fillers(segments, language, report)
+        if mode == "ai-only":
+            # AI-only mode: skip all rule-based detection
+            print("Mode: AI-only (no rule-based detection)")
+            if not ai_retakes_file:
+                print("ERROR: ai-only mode requires --ai-retakes file")
+                print("First run with --transcribe-only, then analyze sentences with AI,")
+                print("then run again with --mode ai-only --ai-retakes retakes.json")
+                return report
 
-        if mode in ("full", "ai"):
-            # Text-based repeat detection
-            print("Step 2b: Text-based repeat detection...")
-            segments = detect_repeats(segments, report)
-
-        # Apply AI retakes if provided
-        if ai_retakes_file:
-            print(f"Step 2c: Applying AI-identified retakes from {ai_retakes_file}...")
+            print(f"Step 2: Applying AI-identified retakes from {ai_retakes_file}...")
             with open(ai_retakes_file, "r", encoding="utf-8") as f:
                 ai_data = json.load(f)
-            # ai_data should be a list of sentence IDs to remove
             retake_ids = ai_data if isinstance(ai_data, list) else ai_data.get("remove_ids", [])
             segments = apply_ai_retakes(segments, retake_ids, sentences_data, report)
+
+            # Save intermediates if requested
+            if save_intermediates_flag:
+                print("Saving intermediate files...")
+                sentences = _group_into_sentences(segments, pause_threshold=0.4)
+                save_intermediates(input_file, segments, sentences,
+                                   set(retake_ids), "ai_only", report)
+        else:
+            # Rule-based modes: filler, full, ai
+            # Step 2: Detect and mark removals
+            print("Step 2: Detecting fillers...")
+            segments = detect_fillers(segments, language, report)
+
+            if save_intermediates_flag:
+                sentences = _group_into_sentences(segments, pause_threshold=0.4)
+                filler_ids = {i for i, s in enumerate(sentences) if not s.keep}
+                save_intermediates(input_file, segments, sentences,
+                                   filler_ids, "after_filler_detection", report)
+
+            if mode in ("full", "ai"):
+                # Text-based repeat detection
+                print("Step 2b: Text-based repeat detection...")
+                segments = detect_repeats(segments, report)
+
+                if save_intermediates_flag:
+                    sentences = _group_into_sentences(segments, pause_threshold=0.4)
+                    repeat_ids = {i for i, s in enumerate(sentences) if not s.keep}
+                    save_intermediates(input_file, segments, sentences,
+                                       repeat_ids, "after_repeat_detection", report)
+
+            # Apply AI retakes if provided
+            if ai_retakes_file:
+                print(f"Step 2c: Applying AI-identified retakes from {ai_retakes_file}...")
+                with open(ai_retakes_file, "r", encoding="utf-8") as f:
+                    ai_data = json.load(f)
+                retake_ids = ai_data if isinstance(ai_data, list) else ai_data.get("remove_ids", [])
+                segments = apply_ai_retakes(segments, retake_ids, sentences_data, report)
+
+                if save_intermediates_flag:
+                    sentences = _group_into_sentences(segments, pause_threshold=0.4)
+                    all_removed = {i for i, s in enumerate(sentences) if not s.keep}
+                    save_intermediates(input_file, segments, sentences,
+                                       all_removed, "after_ai_retakes", report)
 
         # Step 3: Rebuild audio
         print("Step 3: Rebuilding audio with FFmpeg (precise cutting)...")
@@ -865,6 +1002,15 @@ def cleanup_audio(
     if show_report:
         print()
         print(report.summary())
+
+    # Save report JSON if intermediates requested
+    if save_intermediates_flag:
+        intermediates_dir = input_file.parent / f"{input_file.stem}_intermediates"
+        intermediates_dir.mkdir(exist_ok=True)
+        report_path = intermediates_dir / "final_report.json"
+        with open(report_path, "w", encoding="utf-8") as f:
+            json.dump(report.to_dict(), f, ensure_ascii=False, indent=2)
+        print(f"Report saved: {report_path}")
 
     return report
 
@@ -882,15 +1028,18 @@ Examples:
   %(prog)s recording.mp3 -o clean.mp3 --report     # Save report as JSON
   %(prog)s recording.mp3 --model-size large-v3     # Use larger model for accuracy
   %(prog)s recording.mp3 --transcribe-only         # Only transcribe (saves sentences JSON)
-  %(prog)s recording.mp3 --ai-retakes retakes.json # Apply AI-detected retakes
+  %(prog)s recording.mp3 --ai-retakes retakes.json # Apply AI-detected retakes (hybrid)
+  %(prog)s recording.mp3 --mode ai-only --ai-retakes retakes.json  # AI-only mode
+  %(prog)s recording.mp3 --mode ai-only --ai-retakes r.json --save-intermediates  # With debug output
         """,
     )
     parser.add_argument("input", help="Input audio file path")
     parser.add_argument("-o", "--output", help="Output file path (default: input_cleaned.ext)")
     parser.add_argument("-l", "--language", default="zh", choices=["zh", "en"],
                         help="Language (default: zh)")
-    parser.add_argument("-m", "--mode", default="full", choices=["silence", "filler", "full", "ai"],
-                        help="Cleanup mode (default: full)")
+    parser.add_argument("-m", "--mode", default="full",
+                        choices=["silence", "filler", "full", "ai", "ai-only"],
+                        help="Cleanup mode (default: full). ai-only skips all rules, uses only AI retakes")
     parser.add_argument("--model-size", default="medium",
                         choices=["tiny", "base", "small", "medium", "large-v3"],
                         help="Whisper model size (default: medium)")
@@ -906,6 +1055,8 @@ Examples:
                         help="Only transcribe and save transcript/sentences (no rebuild)")
     parser.add_argument("--ai-retakes", metavar="FILE",
                         help="JSON file with AI-identified retake sentence IDs to remove")
+    parser.add_argument("--save-intermediates", action="store_true",
+                        help="Save all intermediate files for debugging/auditing")
 
     args = parser.parse_args()
 
@@ -920,6 +1071,7 @@ Examples:
         silence_thresh_db=args.silence_thresh,
         transcribe_only=args.transcribe_only,
         ai_retakes_file=args.ai_retakes,
+        save_intermediates_flag=args.save_intermediates,
     )
 
     if args.report:

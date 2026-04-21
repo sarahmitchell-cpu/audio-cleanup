@@ -1,18 +1,19 @@
 # Audio Cleanup — 音频录音自动清理工具
 
-一款基于 AI 的音频清理工具，自动去除录音中的**停顿、口头禅、重复内容和废话段落**，类似剪映的"删口癖"功能，但更强大——支持语义级别的重复检测和 AI 辅助的重录片段识别。
+一款基于 AI 的音频清理工具，自动去除录音中的**停顿、口头禅、重复内容和废话段落**，类似剪映的"删口癖"功能，但更强大——支持 AI 驱动的语义分析，智能识别重录片段。
 
 ## 功能特性
 
 | 功能 | 说明 |
 |------|------|
+| **AI 驱动裁定** | 由 LLM 分析转录文本，仅保留通顺、不重复的完整句子 |
 | 静音/停顿去除 | 自动检测并裁剪超长停顿，保留自然节奏 |
 | 呼吸声检测 | 识别并去除句间呼吸声 |
 | 口头禅/语气词去除 | 中文：嗯、啊、呃、那个、就是说等；英文：um、uh、you know 等 |
-| 文本级重复检测 | 三层检测：句子级、短语级、单词级 |
-| AI 辅助重录识别 | 通过外部 LLM 语义分析，识别录音中的"重录片段"（说错后重新说的段落） |
+| 文本级重复检测 | 三层检测：句子级、短语级、单词级（可选，规则模式） |
 | 精准剪辑 | 基于 FFmpeg 从原始文件精确裁切，避免二次编码损失 |
 | 转录缓存 | Whisper 转录结果缓存为 JSON，后续处理无需重新转录 |
+| **中间产物审计** | 每一步输出详细 JSON 文件，方便 debug 和审计 |
 
 ## 系统要求
 
@@ -60,9 +61,9 @@ python3 audio_cleanup.py recording.wav --mode full
 python3 audio_cleanup.py recording.wav --report
 ```
 
-## AI 辅助清理（两阶段流程）
+## 推荐流程：AI-Only 模式（两阶段）
 
-对于重录内容较多的录音（如播客、旁白、课程录制），推荐使用 AI 辅助的两阶段处理流程：
+对于重录内容较多的录音（如播客、旁白、课程录制），推荐使用纯 AI 裁定的两阶段流程。这种方式完全跳过基于固定规则的检测（口头禅匹配、文本相似度等），**由 AI 统一决定哪些句子保留**，避免误删。
 
 ### 阶段一：转录
 
@@ -72,22 +73,90 @@ python3 audio_cleanup.py recording.wav --transcribe-only
 ```
 
 生成两个文件：
-- `recording_transcript.json` — 逐字级别的转录结果
-- `recording_sentences.json` — 按停顿分组的句子列表
+- `recording_transcript.json` — 逐字级别的转录结果（词级时间戳）
+- `recording_sentences.json` — 按停顿分组的句子列表（供 AI 分析）
+
+#### `recording_transcript.json` 格式示例
+
+每个元素是 Whisper 输出的一个"词"片段（中文通常 2-4 字）：
+
+```json
+[
+  {
+    "idx": 0,
+    "start": 3.290,
+    "end": 3.970,
+    "text": "左边",
+    "keep": true,
+    "removal_reason": ""
+  },
+  {
+    "idx": 1,
+    "start": 3.970,
+    "end": 4.370,
+    "text": "这张",
+    "keep": true,
+    "removal_reason": ""
+  }
+]
+```
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `idx` | int | 词片段序号（全局唯一） |
+| `start` | float | 起始时间（秒） |
+| `end` | float | 结束时间（秒） |
+| `text` | str | 转录文本 |
+| `keep` | bool | 是否保留（初始全部为 true） |
+| `removal_reason` | str | 删除原因（初始为空） |
+
+#### `recording_sentences.json` 格式示例
+
+词片段按停顿（≥0.4秒）分组为句子：
+
+```json
+[
+  {
+    "id": 0,
+    "start": 3.290,
+    "end": 11.870,
+    "text": "左边这张照片是1972年阿波罗17号拍摄的地球照片右边这张照片是2026年阿尔推米斯2号拍摄的地",
+    "word_indices": [0, 1, 2, 3, 4, 5, ...]
+  },
+  {
+    "id": 1,
+    "start": 12.600,
+    "end": 17.300,
+    "text": "球照片右边这张照片是2026年阿尔推米斯2号拍摄的地球照片",
+    "word_indices": [43, 44, 45, ...]
+  }
+]
+```
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `id` | int | 句子编号（供 AI 引用） |
+| `start` | float | 句子起始时间（秒） |
+| `end` | float | 句子结束时间（秒） |
+| `text` | str | 句子完整文本 |
+| `word_indices` | list[int] | 对应 transcript.json 中的词片段索引 |
 
 ### 阶段二：AI 分析 + 应用
 
-将 `recording_sentences.json` 发送给 LLM（如 Claude、GPT-4），请它分析哪些句子是"重录的废片段"（说错了重新说的部分），返回需要删除的句子 ID 列表。
+将 `recording_sentences.json` 发送给 LLM（如 Claude、GPT-4），让 AI 分析并返回需要**删除**的句子 ID 列表。
 
 **提示词示例：**
 ```
-以下是一段录音的逐句转录。录音者在录制过程中经常说错后重新说。
-请分析每一句，识别出哪些是"重录前的废片段"（即说错后被重新说过的句子）。
-返回所有应该删除的句子ID列表（JSON数组格式）。
+以下是一段录音的逐句转录（按停顿自动分组）。录音者在录制过程中经常说错后重新说。
 
-规则：
+请分析所有句子，返回需要删除的句子 ID 列表（JSON 数组格式）。
+
+删除规则：
 - 如果连续多句说的是同一段内容，保留最后一次（最完整的版本），前面的标记为删除
-- 开头的试音、清嗓子等也应删除
+- 不完整的句子片段（如被截断、只有一两个字）应删除
+- 内部有明显重复的句子（如"那时人类会那时人类会开启..."）应删除
+- 结巴/断句的碎片应删除
+- 只保留通顺、不重复的完整句子
 - 不确定的句子不要删除
 
 [粘贴 sentences.json 内容]
@@ -95,18 +164,23 @@ python3 audio_cleanup.py recording.wav --transcribe-only
 
 将 AI 返回的 ID 列表保存为 JSON 文件（如 `retakes.json`）：
 ```json
-[0, 2, 3, 7, 17, 28, 29, 32, 33, ...]
+[0, 2, 3, 28, 29, 32, 33, 36, 44, 54, 55, ...]
 ```
 
-然后应用：
+然后使用 `ai-only` 模式应用，并保存所有中间产物：
 ```bash
-# 使用 AI 标记的重录ID + 文本检测 + 口头禅去除，一起处理
-python3 audio_cleanup.py recording.wav --ai-retakes retakes.json --report
+python3 audio_cleanup.py recording.wav \
+  --mode ai-only \
+  --ai-retakes retakes.json \
+  --save-intermediates \
+  -o recording_cleaned.wav
 ```
 
 ## 处理流程详解
 
 ### 整体架构
+
+根据 `--mode` 参数，工具有两条主要处理路径：
 
 ```
 输入音频
@@ -114,35 +188,170 @@ python3 audio_cleanup.py recording.wav --ai-retakes retakes.json --report
    ├──[缓存存在?]──→ 加载缓存转录
    │       否
    ▼
-┌─────────────────────────┐
-│  Whisper 语音转录        │  faster-whisper, word_timestamps=True
-│  生成逐字时间戳          │  VAD 过滤，最小静音 300ms
-└─────────────────────────┘
+┌─────────────────────────────────┐
+│  Step 1: Whisper 语音转录        │  faster-whisper, word_timestamps=True
+│  生成逐字时间戳                  │  VAD 过滤，最小静音 300ms
+│  输出: transcript.json           │
+│  输出: sentences.json            │
+└─────────────────────────────────┘
    │
-   ▼ 保存 transcript.json + sentences.json（缓存）
+   ├─── mode=ai-only ───────────────────────────────────────┐
+   │                                                         │
+   │    ┌─────────────────────────────────────────────┐      │
+   │    │  Step 2: AI 裁定                             │      │
+   │    │  读取 --ai-retakes 文件                      │      │
+   │    │  按句子 ID 标记 keep=False                    │      │
+   │    │  输出: intermediates/ai_only_decisions.json   │      │
+   │    │  输出: intermediates/ai_only_kept_segments    │      │
+   │    │  输出: intermediates/ai_only_removed_segments │      │
+   │    └─────────────────────────────────────────────┘      │
+   │                                                         │
+   ├─── mode=full/ai ───────────────────────┐               │
+   │                                         │               │
+   │    ┌───────────────────────────┐       │               │
+   │    │  Step 2a: 口头禅检测      │       │               │
+   │    │  匹配预定义语气词列表     │       │               │
+   │    └───────────────────────────┘       │               │
+   │              │                          │               │
+   │    ┌───────────────────────────┐       │               │
+   │    │  Step 2b: 文本重复检测    │       │               │
+   │    │  三层算法（句子/短语/词） │       │               │
+   │    └───────────────────────────┘       │               │
+   │              │                          │               │
+   │    ┌───────────────────────────┐       │               │
+   │    │  Step 2c: AI 重录标记     │       │               │
+   │    │  (如提供 --ai-retakes)    │       │               │
+   │    └───────────────────────────┘       │               │
+   │                                         │               │
+   ├─────────────────────────────────────────┘               │
+   │                                                         │
+   ◄─────────────────────────────────────────────────────────┘
    │
-┌─────────────────────────┐
-│  Step 1: 口头禅检测      │  匹配预定义语气词列表
-│  (Filler Detection)     │  标记 keep=False
-└─────────────────────────┘
-   │
-┌─────────────────────────┐
-│  Step 2: 重复检测        │  三层检测算法（详见下文）
-│  (Repeat Detection)     │  标记 keep=False
-└─────────────────────────┘
-   │
-┌─────────────────────────┐
-│  Step 2c: AI 重录标记    │  应用外部 AI 分析结果
-│  (AI Retake Marking)    │  按句子ID标记 keep=False
-└─────────────────────────┘
-   │
-┌─────────────────────────┐
-│  Step 3: FFmpeg 精准剪辑 │  从原始文件裁切保留片段
-│  合并 + 归一化           │  拼接 → normalize → 输出
-└─────────────────────────┘
+┌─────────────────────────────────┐
+│  Step 3: FFmpeg 精准剪辑        │  从原始文件裁切保留片段
+│  合并 + 归一化                   │  拼接 → normalize → 输出
+└─────────────────────────────────┘
    │
    ▼
-输出音频 + 报告
+输出音频 + 报告 + 中间产物
+```
+
+### 中间产物（`--save-intermediates`）
+
+启用 `--save-intermediates` 后，工具会在输入文件同目录下创建 `{filename}_intermediates/` 文件夹，保存每一步的详细数据。
+
+#### 目录结构
+
+```
+Recording 58_intermediates/
+├── ai_only_decisions.json        # 每个句子的保留/删除决策
+├── ai_only_kept_segments.json    # 所有保留的词级片段（含时间戳和文本）
+├── ai_only_removed_segments.json # 所有删除的词级片段（含时间戳、文本和原因）
+├── ai_only_summary.txt           # 人类可读的决策摘要
+└── final_report.json             # 最终处理报告（输入/输出时长、压缩率等）
+```
+
+#### `ai_only_decisions.json` 格式示例
+
+```json
+[
+  {
+    "sentence_id": 0,
+    "text": "左边这张照片是1972年阿波罗17号拍摄的地球照片右边这张照片是2026年阿尔推米斯2号拍摄的地",
+    "start": 3.29,
+    "end": 11.87,
+    "duration": 8.58,
+    "decision": "REMOVE",
+    "reason": "AI: fragment/repeat/incomplete",
+    "word_count": 43,
+    "kept_words": 0
+  },
+  {
+    "sentence_id": 1,
+    "text": "球照片右边这张照片是2026年阿尔推米斯2号拍摄的地球照片",
+    "start": 12.6,
+    "end": 17.3,
+    "duration": 4.7,
+    "decision": "KEEP",
+    "reason": "",
+    "word_count": 18,
+    "kept_words": 18
+  }
+]
+```
+
+| 字段 | 说明 |
+|------|------|
+| `sentence_id` | 句子编号（对应 sentences.json 中的 id） |
+| `text` | 句子文本 |
+| `start/end` | 时间范围（秒） |
+| `duration` | 句子时长（秒） |
+| `decision` | `KEEP` 或 `REMOVE` |
+| `reason` | 删除原因 |
+| `word_count` | 包含的词片段数 |
+| `kept_words` | 保留的词片段数 |
+
+#### `ai_only_kept_segments.json` 格式示例
+
+```json
+[
+  {"start": 12.6, "end": 12.84, "text": "球"},
+  {"start": 12.84, "end": 13.22, "text": "照片"},
+  {"start": 13.22, "end": 13.68, "text": "右边"},
+  {"start": 13.68, "end": 14.2, "text": "这张照片"}
+]
+```
+
+#### `ai_only_removed_segments.json` 格式示例
+
+```json
+[
+  {"start": 3.29, "end": 3.97, "text": "左边", "reason": "AI retake: sentence 0"},
+  {"start": 3.97, "end": 4.37, "text": "这张", "reason": "AI retake: sentence 0"},
+  {"start": 4.37, "end": 4.81, "text": "照片", "reason": "AI retake: sentence 0"}
+]
+```
+
+#### `ai_only_summary.txt` 格式示例
+
+```
+=== ai_only Stage Summary ===
+
+Total sentences: 299
+Kept: 222
+Removed: 77
+
+--- Kept Sentences ---
+  [  1] (12.6-17.3s) 球照片右边这张照片是2026年阿尔推米斯2号拍摄的地球照片
+  [  4] (25.4-28.3s) 好像1972年拍摄的要更通透
+  [  5] (29.6-32.3s) 难道NASA的技术还不如以前了
+  ...
+
+--- Removed Sentences ---
+  [  0] (3.3-11.9s) 左边这张照片是1972年阿波罗17号拍摄的地球照片...
+         Reason: AI: fragment/repeat/incomplete
+  [  2] (18.3-21.9s) 乍一看好像19
+         Reason: AI: fragment/repeat/incomplete
+  ...
+```
+
+#### `final_report.json` 格式示例
+
+```json
+{
+  "input_file": "recording.wav",
+  "output_file": "recording_cleaned.wav",
+  "input_duration_sec": 1785.5,
+  "output_duration_sec": 1043.4,
+  "saved_sec": 742.1,
+  "saved_pct": 41.6,
+  "silences_removed": 0,
+  "fillers_removed": 0,
+  "repeats_removed": 77,
+  "breaths_removed": 0,
+  "filler_texts": [],
+  "repeat_texts": ["[AI] #0: 左边这张照片...", "..."]
+}
 ```
 
 ### 核心数据结构
@@ -173,75 +382,6 @@ class Sentence:
 
 通过 `_group_into_sentences()` 将词级片段按停顿间隔分组为句子。默认停顿阈值 0.4 秒——两个词之间如果超过 0.4 秒没有语音，就被视为不同的句子。
 
-### 重复检测算法（三层）
-
-重复检测是本工具的核心算法，采用三层递进检测策略：
-
-#### 第一层：句子级重复检测（Pass 1）
-
-在滑动窗口内（默认 window=8），对每对句子进行三种比较：
-
-**1. 近似重复（similarity ≥ 0.55）**
-- 使用 `difflib.SequenceMatcher` 计算文本相似度
-- 阈值 0.55 意味着超过一半的内容相同即判定为重复
-- 始终保留后一个（更完整的版本），删除前一个
-- 时间限制：两句之间不超过 15 秒
-
-```
-示例：
-  句子A："今天我们来讲一下关于机器学习"     ← 删除
-  句子B："今天我们来讲一下关于机器学习的基础概念"  ← 保留
-  相似度：0.72 ≥ 0.55 → 判定为重复
-```
-
-**2. 前缀重试（Prefix Retry）**
-- 检测"说了半句话就停下来重新说"的模式
-- 判断条件：句子A 是句子B 的前缀部分（overlap ≥ 0.5）
-- 句子A 不能比句子B 长超过 30%
-
-```
-示例：
-  句子A："我们可以看到这个"           ← 删除（前缀重试）
-  句子B："我们可以看到这个数据的变化趋势"  ← 保留
-```
-
-**3. 短语级重复（Phrase Repeat）**
-- 使用最长公共子串（LCS）算法
-- 如果两句共享 ≥ 6 个字符的公共子串，或子串长度 ≥ 较短句子的 50%
-- 用于捕捉句子整体不同但关键短语重复的情况
-
-```
-示例：
-  句子A："右边这张照片是上周拍的"        ← 删除
-  句子B："然后右边这张照片展示的是最新数据"  ← 保留
-  LCS = "右边这张照片" (6字) → 判定为短语重复
-```
-
-#### 第一层附加：粗粒度重复检测（Pass 1b）
-
-使用更大的停顿阈值（0.8 秒）重新分组句子，然后再跑一遍相同的检测逻辑。这是因为细粒度分组（0.4 秒）可能把一个完整的重复拆成多段而漏检。
-
-#### 第二层：单词级重复（Pass 2）
-
-检测连续出现的相同单词（结巴/口吃）：
-- 相邻两个保留的词如果文本完全相同，且间隔 < 2 秒，删除前一个
-
-```
-示例：
-  "我们" "我们" "需要考虑"  →  "我们" "需要考虑"
-```
-
-### AI 重录识别
-
-`apply_ai_retakes()` 函数接收外部 AI 分析返回的句子 ID 列表，将对应句子标记为删除。
-
-工作流程：
-1. 重新调用 `_group_into_sentences()` 将当前存活的词级片段分组为句子
-2. 遍历 AI 返回的 ID 列表，将对应句子的所有词级片段标记为 `keep=False`
-3. 统计到 `CleanupReport` 中
-
-注意：AI 重录标记在文本检测之后执行，因此句子的编号可能因前面的检测而发生变化。建议使用 `--transcribe-only` 独立生成的 `sentences.json` 中的 ID。
-
 ### 音频重建（FFmpeg 精准剪辑）
 
 `rebuild_audio_ffmpeg()` 的处理步骤：
@@ -260,7 +400,7 @@ class Sentence:
 
 ### 转录缓存机制
 
-Whisper 转录是最耗时的步骤（medium 模型处理 30 分钟音频约需 25 分钟）。为了支持快速迭代，实现了缓存机制：
+Whisper 转录是最耗时的步骤（medium 模型处理 30 分钟音频约需 25 分钟）。缓存机制：
 
 - 转录结果保存为 `{filename}_transcript.json`（词级别）和 `{filename}_sentences.json`（句子级别）
 - 后续运行时自动检测缓存文件，跳过转录步骤
@@ -273,46 +413,69 @@ Whisper 转录是最耗时的步骤（medium 模型处理 30 分钟音频约需 
 | `silence` | 仅去除长停顿 | 快速处理，保守策略 |
 | `filler` | 去除停顿 + 口头禅 | 日常对话清理 |
 | `full` | 停顿 + 口头禅 + 文本重复检测 | 通用全功能清理 |
-| `ai` | 同 full + AI 重录识别 | 重录频繁的专业录音 |
+| `ai` | 同 full + AI 重录识别 | 混合模式 |
+| **`ai-only`** | **纯 AI 裁定，跳过所有规则** | **推荐：避免误删，效果最佳** |
 
 ## 参数说明
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
 | `--language` | zh | 语言：zh（中文）或 en（英文） |
-| `--mode` | full | 处理模式：silence / filler / full / ai |
+| `--mode` | full | 处理模式：silence / filler / full / ai / ai-only |
 | `--model-size` | medium | Whisper 模型：tiny / base / small / medium / large-v3 |
 | `--min-silence` | 700 | 最小静音时长（ms），低于此值的停顿不处理 |
 | `--keep-silence` | 250 | 保留的停顿时长（ms），保持自然节奏 |
 | `--silence-thresh` | -40 | 静音阈值（dB），低于此值视为静音 |
 | `--transcribe-only` | — | 仅转录，不处理音频 |
 | `--ai-retakes` | — | AI 重录标记文件（JSON 句子 ID 数组） |
+| `--save-intermediates` | — | 保存所有中间产物到 `{filename}_intermediates/` |
 | `--report` | — | 生成 JSON 格式的处理报告 |
 
 ## 输出示例
 
-处理 30 分钟中文录音的典型结果：
+### AI-Only 模式处理结果
 
 ```
 === Audio Cleanup Report ===
-Input:  recording.wav (1786.6s)
-Output: recording_cleaned.wav (829.0s)
-Saved:  957.6s (53.6%)
+Input:  recording.wav (1785.5s)
+Output: recording_cleaned.wav (1043.4s)
+Saved:  742.1s (41.6%)
 
 Silences removed: 0 (0.0s)
 Breaths removed:  0 (0.0s)
-Fillers removed:  43
-  Filler words: 嗯, 啊, 然后, 对吧, 就是, ...
-Repeats removed: 118
-  Repeated: [AI] #0: 大家好..., [REPEAT 72%] 今天我们→今天我们来, ...
+Fillers removed:  0
+Repeats removed: 77
 ```
+
+## 规则模式：文本级重复检测算法（参考）
+
+> 以下算法在 `full` 和 `ai` 模式中使用，`ai-only` 模式不使用。
+
+采用三层递进检测策略：
+
+### 第一层：句子级重复检测
+
+在滑动窗口内（默认 window=8），对每对句子进行三种比较：
+
+**1. 近似重复（similarity >= 0.55）**
+- 使用 `difflib.SequenceMatcher` 计算文本相似度
+- 始终保留后一个（更完整的版本），删除前一个
+
+**2. 前缀重试（Prefix Retry）**
+- 检测"说了半句话就停下来重新说"的模式
+
+**3. 短语级重复（Phrase Repeat）**
+- 使用最长公共子串（LCS）算法，阈值 >= 6 字符
+
+### 第二层：单词级重复
+
+检测连续出现的相同单词（结巴/口吃），间隔 < 2 秒。
 
 ## 已知限制
 
-1. **Whisper 转录精度**：中文分词偶有误差，可能影响重复检测的准确度
-2. **阈值敏感性**：相似度阈值（0.55）和停顿阈值（0.4s）对不同录音风格可能需要调整
-3. **AI 句子ID偏移**：如果先运行文本检测再应用 AI 标记，句子编号可能有偏移。建议使用 `--transcribe-only` 生成的原始句子 ID
-4. **语言支持**：目前仅支持中文和英文的口头禅检测，但 Whisper 转录支持更多语言
+1. **Whisper 转录精度**：中文分词偶有误差，可能导致句子边界划分不准
+2. **AI 模式依赖外部 LLM**：需要手动将 sentences.json 发送给 AI 并取回结果
+3. **语言支持**：目前仅支持中文和英文的口头禅检测，但 Whisper 转录支持更多语言
 
 ## 技术依赖
 
